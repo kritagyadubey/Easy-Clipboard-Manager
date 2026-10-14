@@ -42,7 +42,11 @@ class TrayController(QObject):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             log.warning("No system tray available in this session")
             return False
-        self._tray = QSystemTrayIcon(APP_NAME, self)
+        # NOTE: QSystemTrayIcon takes (icon, parent) or (parent) — a bare
+        # string for the first positional argument raises TypeError.  The
+        # app name belongs in the tooltip.
+        self._tray = QSystemTrayIcon(self)
+        self._tray.setToolTip(APP_NAME)
         self._menu = QMenu()
         self._build_menu()
         self._tray.setContextMenu(self._menu)

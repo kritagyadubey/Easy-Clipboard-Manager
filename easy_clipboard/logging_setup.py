@@ -45,10 +45,13 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
         # A broken log location must never prevent the app from starting.
         pass
 
-    stream_handler = logging.StreamHandler(stream=sys.stderr)
-    stream_handler.setFormatter(formatter)
-    stream_handler.setLevel(logging.WARNING)
-    logger.addHandler(stream_handler)
+    # In a windowed (no-console) build sys.stderr can be None; a stream
+    # handler pointing at None would fail on every emit.
+    if sys.stderr is not None:
+        stream_handler = logging.StreamHandler(stream=sys.stderr)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(logging.WARNING)
+        logger.addHandler(stream_handler)
 
     logger.debug("Easy Clipboard Manager %s starting", __version__)
     _CONFIGURED = True

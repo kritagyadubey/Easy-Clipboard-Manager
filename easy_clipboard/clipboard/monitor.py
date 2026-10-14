@@ -96,6 +96,11 @@ class ClipboardMonitor(QObject):
         log.info("Clipboard monitoring stopped")
 
     def set_paused(self, paused: bool) -> None:
+        # Only log (and only notify) on an actual state change: every persisted
+        # setting write fans out to this method, which used to spam the log
+        # with "resumed" lines that did not correspond to any user action.
+        if paused == self._paused:
+            return
         self._paused = paused
         log.info("Clipboard monitoring %s", "paused" if paused else "resumed")
 

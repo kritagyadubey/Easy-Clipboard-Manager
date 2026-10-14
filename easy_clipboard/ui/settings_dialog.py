@@ -36,7 +36,7 @@ from ..settings import (
     SettingsStore,
 )
 from ..windows import autostart
-from ..windows.hotkey import format_hotkey
+from ..windows.hotkey import HotkeyError, format_hotkey, parse_hotkey
 from . import icons
 from .theme import base_font, palette, render_logo
 from .widgets import Card, Switch
@@ -762,6 +762,14 @@ class SettingsDialog(QDialog):
         self._record_button.setText("Record")
 
     def _apply_hotkey(self, combo: str) -> None:
+        # Never persist a combination Windows could not register anyway;
+        # parse first so the user gets a precise reason.
+        try:
+            parse_hotkey(combo)
+        except HotkeyError as exc:
+            self._hotkey_status.setText(f"Not a usable shortcut: {exc}")
+            self._hotkey_status.setStyleSheet("")
+            return
         self._store.update(global_hotkey=combo)
         self._hotkey_field.setText(format_hotkey(combo))
         # The application re-registers via its settings listener; verify here.
@@ -858,6 +866,24 @@ class _HotkeyCaptureDialog(QDialog):
 
     captured = Signal(str)
 
+    # Keys that are modifiers, not the final key of a shortcut.  Pressing
+    # one alone must keep waiting instead of producing garbage such as
+    # "Ctrl+Ctrl" (which could then never be registered).
+    _MODIFIER_KEYS = frozenset(
+        {
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta,
+            Qt.Key.Key_AltGr,
+            Qt.Key.Key_Super_L,
+            Qt.Key.Key_Super_R,
+            Qt.Key.Key_Hyper_L,
+            Qt.Key.Key_Hyper_R,
+            Qt.Key.Key_Mode_switch,
+        }
+    )
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Record shortcut")
@@ -877,6 +903,9 @@ class _HotkeyCaptureDialog(QDialog):
         hint.setWordWrap(True)
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(hint)
+        # Keep a direct reference: findChild(QLabel) would return the title
+        # label above and overwrite it with the hint text.
+        self._hint = hint
         cancel = QPushButton("Cancel")
         cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel.clicked.connect(self.reject)
@@ -886,10 +915,17 @@ class _HotkeyCaptureDialog(QDialog):
         row.addStretch(1)
         layout.addLayout(row)
 
+    def _set_hint(self, text: str) -> None:
+        self._hint.setText(text)
+
     def keyPressEvent(self, event) -> None:  # noqa: N802
         key = event.key()
         if key in (Qt.Key.Key_unknown, Qt.Key.Key_Escape):
             self.reject()
+            return
+        if key in self._MODIFIER_KEYS:
+            # Ctrl on its own is not a shortcut — keep listening.
+            self._set_hint("Now press the actual key, e.g. V or F9.")
             return
         modifiers = event.modifiers()
         parts = []
@@ -906,10 +942,15 @@ class _HotkeyCaptureDialog(QDialog):
             self.reject()
             return
         if not parts:
-            hint = self.findChild(QLabel)
-            if hint is not None:
-                hint.setText("Add a modifier: Ctrl, Alt, Shift or Win.")
+            self._set_hint("Add a modifier: Ctrl, Alt, Shift or Win.")
             return
         parts.append(key_name)
-        self.captured.emit("+".join(parts))
+        combo = "+".join(parts)
+        try:
+            parse_hotkey(combo)
+        except HotkeyError as exc:
+            # Do not accept a combo the app could never register.
+            self._set_hint(f"Not usable: {exc}")
+            return
+        self.captured.emit(combo)
         self.accept()

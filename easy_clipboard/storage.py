@@ -121,9 +121,12 @@ class Database:
             conn.executescript(_SCHEMA)
             conn.commit()
             self._conn = conn
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, OSError) as exc:
+            # OSError matters too: mkdir() raises PermissionError (a real
+            # OSError) when the data folder cannot be created, and that used
+            # to escape as an unhandled exception during startup.
             raise DatabaseError(
-                f"Could not open the clipboard database at {self._path}"
+                f"Could not open the clipboard database at {self._path} ({exc})"
             ) from exc
 
     @property

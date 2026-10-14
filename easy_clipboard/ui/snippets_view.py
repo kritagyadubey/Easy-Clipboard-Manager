@@ -136,13 +136,31 @@ class SnippetsView(QWidget):
     # Public API
     # ------------------------------------------------------------------
     def set_snippets(
-        self, snippets: list[Snippet], *, keep_selection: bool = False
+        self,
+        snippets: list[Snippet],
+        *,
+        keep_selection: bool = False,
+        total: Optional[int] = None,
     ) -> None:
+        """Replace the list contents.
+
+        ``total`` is the number of snippets before filtering; when the
+        visible list is shorter the count label says "of N" so the user
+        knows the search narrowed the results.
+        """
         previous = self._selected_id if keep_selection else None
+        if not keep_selection:
+            # Drop the mirror of the selection: the id may refer to an entry
+            # that no longer exists (deleted or filtered away).
+            self._selected_id = None
         self._model.set_snippets(snippets)
-        self._count_label.setText(
-            fmt.count_label(len(snippets), "snippet", "snippets") if snippets else ""
-        )
+        if not snippets:
+            self._count_label.setText("")
+        else:
+            label = fmt.count_label(len(snippets), "snippet", "snippets")
+            if total is not None and len(snippets) < total:
+                label = f"{label} of {total:,}"
+            self._count_label.setText(label)
         if previous is not None:
             row = self._model.row_for_id(previous)
             if row >= 0:

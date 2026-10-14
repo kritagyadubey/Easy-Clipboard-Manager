@@ -35,6 +35,10 @@ _TYPE_LABELS = {
     ContentType.CODE: "Code",
 }
 
+# Longest prefix of a clipboard entry turned into a list preview.  Far more
+# than any row can display, but bounded so huge pastes stay cheap to paint.
+_PREVIEW_LIMIT = 1000
+
 
 def content_hash(content: str) -> str:
     """Stable identity for a piece of clipboard text (UTF-8, SHA-256)."""
@@ -70,8 +74,16 @@ class ClipItem:
 
     @property
     def preview_text(self) -> str:
-        """Single-line preview safe to show in a list."""
-        return " ".join(self.content.split())
+        """Single-line preview safe to show in a list.
+
+        Capped so a multi-megabyte paste is not re-collapsed (and measured)
+        on every repaint of the list; the full text stays in the preview
+        panel, which renders it lazily.
+        """
+        truncated = len(self.content) > _PREVIEW_LIMIT
+        text = self.content[:_PREVIEW_LIMIT] if truncated else self.content
+        collapsed = " ".join(text.split())
+        return collapsed + "…" if truncated else collapsed
 
     @property
     def is_protected(self) -> bool:

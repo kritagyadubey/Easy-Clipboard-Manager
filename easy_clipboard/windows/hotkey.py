@@ -12,7 +12,7 @@ import ctypes
 import ctypes.wintypes as wt
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Qt, Signal
 from PySide6.QtWidgets import QApplication, QWidget
 
 from ..logging_setup import get_logger
@@ -39,6 +39,36 @@ _VK_KEYS = {
     "F7": 0x76, "F8": 0x77, "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
     "SPACE": 0x20, "TAB": 0x09, "INSERT": 0x2D, "DELETE": 0x2E,
     "HOME": 0x24, "END": 0x23, "PRIOR": 0x21, "NEXT": 0x22,
+    # Aliases matching what QKeySequence(key).toString() produces, plus the
+    # navigation/editing keys the shortcut recorder can capture.
+    "INS": 0x2D, "DEL": 0x2E, "PGUP": 0x21, "PGDN": 0x22, "PGDOWN": 0x22,
+    "BACKSPACE": 0x08, "BACK": 0x08,
+    "ESC": 0x1B, "ESCAPE": 0x1B,
+    "RETURN": 0x0D, "ENTER": 0x0D,
+    "UP": 0x26, "DOWN": 0x28, "LEFT": 0x25, "RIGHT": 0x27,
+    # Punctuation keys as rendered by QKeySequence (usable in shortcuts).
+    ",": 0xBC, ".": 0xBE, ";": 0xBA, "'": 0xDE, "[": 0xDB, "]": 0xDD,
+    "\\": 0xDC, "/": 0xBF, "`": 0xC0, "=": 0xBB,
+}
+
+# Preferred display names for the keys above (checked before the generic
+# fallback so that, e.g., VK_DELETE displays as "Del", not "Delete").
+_DISPLAY_NAMES = {
+    0x08: "Backspace",
+    0x09: "Tab",
+    0x0D: "Enter",
+    0x1B: "Esc",
+    0x20: "Space",
+    0x21: "PgUp",
+    0x22: "PgDown",
+    0x23: "End",
+    0x24: "Home",
+    0x25: "Left",
+    0x26: "Up",
+    0x27: "Right",
+    0x28: "Down",
+    0x2D: "Ins",
+    0x2E: "Del",
 }
 
 _MODIFIER_TOKENS = {
@@ -70,6 +100,11 @@ def parse_hotkey(text: str) -> tuple[int, int]:
                 raise HotkeyError(f"Unknown modifier: {part}")
             modifiers |= token
         else:
+            if part.lower() in _MODIFIER_TOKENS:
+                # e.g. "Ctrl+Shift" or a bare "Shift": no actual key pressed.
+                raise HotkeyError(
+                    f"'{part}' is a modifier, not a key. Add a key such as 'V' or 'F9'."
+                )
             key = _VK_KEYS.get(upper)
             if key is None:
                 raise HotkeyError(f"Unsupported key: {part}")
@@ -96,7 +131,11 @@ def format_hotkey(combo: str) -> str:
         names.append("Shift")
     if modifiers & MOD_WIN:
         names.append("Win")
-    key_name = next((k.title() for k, v in _VK_KEYS.items() if v == key), str(key))
+    key_name = _DISPLAY_NAMES.get(key)
+    if key_name is None:
+        key_name = next(
+            (k.title() for k, v in _VK_KEYS.items() if v == key), str(key)
+        )
     names.append(key_name)
     return "+".join(names)
 
@@ -142,7 +181,11 @@ class GlobalHotkey(QObject):
             )
         )
         self._registered = ok
-        self._combo = combo if ok else ""
+        # Remember the requested combo even when Windows refuses it: callers
+        # compare `combo` against the desired setting to decide whether a
+        # re-registration is needed, and a failed attempt must not retry
+        # (and re-notify) on every unrelated settings change.
+        self._combo = combo
         if ok:
             log.info("Global shortcut registered: %s", format_hotkey(combo))
         else:
@@ -174,16 +217,22 @@ class GlobalHotkey(QObject):
         self._host.deleteLater()
 
 
-class _HotkeyFilter(QObject):
-    """Bridges native ``WM_HOTKEY`` messages to :class:`GlobalHotkey`."""
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    """Bridges native ``WM_HOTKEY`` messages to :class:`GlobalHotkey`.
+
+    Must derive from ``QAbstractNativeEventFilter`` (not ``QObject``):
+    ``QApplication.installNativeEventFilter`` type-checks its argument and
+    raises ``TypeError`` otherwise — which crashed the app at startup.
+    """
 
     def __init__(self, hotkey: GlobalHotkey):
+        # NOTE: QAbstractNativeEventFilter is not a QObject.
         super().__init__()
         self._hotkey = hotkey
 
-    def nativeEventFilter(self, event_type, message):  # noqa: N802 - Qt API name
+    def nativeEventFilter(self, event_type, message) -> bool:  # noqa: N802 - Qt API name
         try:
             handled = self._hotkey._handle_native(message)
         except Exception:  # noqa: BLE001 - never let the filter raise
-            return False, 0
-        return (True, 0) if handled else (False, 0)
+            return False
+        return bool(handled)

@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import traceback
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import APP_NAME, __version__
@@ -30,6 +31,52 @@ from .windows.window_info import get_foreground_process
 log = get_logger("app")
 
 TRIM_INTERVAL_MS = 5 * 60 * 1000
+
+
+class _ShowBridge(QObject):
+    """Marshals "show the window" requests from the single-instance thread.
+
+    The named-event listener lives in a plain Python thread with no Qt
+    event loop, so it cannot call Qt directly (a ``QTimer.singleShot``
+    posted from there never fires).  Emitting a Qt signal is thread-safe:
+    the slot runs on the GUI thread via a queued connection.
+    """
+
+    requested = Signal()
+
+
+def _install_excepthook() -> None:
+    """Log unexpected exceptions and show the user one friendly dialog."""
+    previous = sys.excepthook
+    shown = False
+
+    def _hook(exc_type, exc, tb) -> None:
+        nonlocal shown
+        try:
+            log.error(
+                "Unhandled exception:\n%s",
+                "".join(traceback.format_exception(exc_type, exc, tb)),
+            )
+        except Exception:  # noqa: BLE001 - logging must never raise here
+            pass
+        if not shown:
+            shown = True
+            try:
+                if QApplication.instance() is not None:
+                    QMessageBox.critical(
+                        None,
+                        f"{APP_NAME} — unexpected error",
+                        "Something went wrong, but the error was recorded in "
+                        "the diagnostic log.\n\n"
+                        "You can open the log folder from Settings → "
+                        "Privacy & data → Open data folder.",
+                    )
+            except Exception:  # noqa: BLE001 - never raise while handling a crash
+                pass
+        if previous is not None:
+            previous(exc_type, exc, tb)
+
+    sys.excepthook = _hook
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -64,6 +111,7 @@ def _offer_database_recovery(exc: DatabaseError) -> bool:
 def run(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     setup_logging(verbose=args.verbose)
+    _install_excepthook()
     log.info("Starting %s %s", APP_NAME, __version__)
 
     # Only one instance may run at a time ---------------------------------
@@ -71,6 +119,23 @@ def run(argv: list[str] | None = None) -> int:
     if not instance.acquire():
         log.info("Another instance is running; requesting it to show its window")
         return 0
+
+    # Buffer "show my window" requests that arrive before Qt is ready (the
+    # named-event listener runs from the moment acquire() succeeds).
+    _show_lock = threading.Lock()
+    _early_show = threading.Event()
+    _bridge_cell: dict[str, _ShowBridge | None] = {"bridge": None}
+
+    def _on_show_request() -> None:
+        with _show_lock:
+            bridge = _bridge_cell["bridge"]
+            if bridge is None:
+                _early_show.set()
+        if bridge is not None:
+            # Thread-safe: emitted over a queued connection to the GUI thread.
+            bridge.requested.emit()
+
+    instance.set_show_handler(_on_show_request)
 
     # Qt application -------------------------------------------------------
     QApplication.setOrganizationName("EasyClipboardManager")
@@ -136,6 +201,7 @@ def run(argv: list[str] | None = None) -> int:
     tray = TrayController()
     tray_available = tray.create()
     tray.set_monitoring(settings.monitoring_enabled)
+    app.tray_available = tray_available
 
     # Clipboard monitor --------------------------------------------------------
     monitor = ClipboardMonitor()
@@ -184,9 +250,10 @@ def run(argv: list[str] | None = None) -> int:
         tray.clear_history_requested.connect(window.clear_history)
         tray.settings_requested.connect(lambda: (window.bring_to_front(), window.open_settings()))
         tray.exit_requested.connect(exit_app)
-    else:
-        # Without a tray, closing the window must quit the application.
-        settings_store.update(minimize_to_tray=False)
+    # (Without a tray there is nothing to connect; MainWindow checks
+    # app.tray_available in closeEvent and quits instead of hiding.  The
+    # user's minimize_to_tray preference is deliberately NOT rewritten —
+    # a headless session is a per-run condition, not a preference.)
 
     # Keep every subsystem in sync with persisted settings ------------------------
     def on_settings_changed(new_settings) -> None:
@@ -204,11 +271,25 @@ def run(argv: list[str] | None = None) -> int:
     settings_store.add_listener(on_settings_changed)
 
     # Periodic maintenance: retention + size limits ---------------------------------
+    def run_maintenance() -> None:
+        try:
+            # Retention must run even when no new copies happened, and the
+            # sidebar counts must refresh either way (refreshing only when
+            # entries were removed used to be skipped exactly when it was
+            # needed, because `run_pending_trim() or refresh()` short-circuits
+            # on a non-zero removal count).
+            history.run_pending_trim()
+            history.trim_history()
+        except Exception:  # noqa: BLE001 - maintenance must never crash the app
+            log.exception("Periodic history maintenance failed")
+        try:
+            window.refresh_sidebar_counts()
+        except Exception:  # noqa: BLE001
+            log.exception("Sidebar count refresh failed")
+
     trim_timer = QTimer()
     trim_timer.setInterval(TRIM_INTERVAL_MS)
-    trim_timer.timeout.connect(
-        lambda: history.run_pending_trim() or window.refresh_sidebar_counts()
-    )
+    trim_timer.timeout.connect(run_maintenance)
     trim_timer.start()
 
     # Apply startup state ------------------------------------------------------------
@@ -222,7 +303,16 @@ def run(argv: list[str] | None = None) -> int:
         window.show()
 
     # A second launch asks us to surface the window ------------------------------------
-    instance.set_show_handler(lambda: QTimer.singleShot(0, window.bring_to_front))
+    # (QTimer.singleShot from the listener thread never fires: that thread
+    # has no Qt event loop.  A signal emitted there is queued to the GUI
+    # thread instead, which works.)
+    show_bridge = _ShowBridge()
+    show_bridge.requested.connect(window.bring_to_front)
+    with _show_lock:
+        _bridge_cell["bridge"] = show_bridge
+        pending_show = _early_show.is_set()
+    if pending_show:
+        show_bridge.requested.emit()
 
     code = app.exec()
     # Defensive cleanup if the app quit without going through exit_app.

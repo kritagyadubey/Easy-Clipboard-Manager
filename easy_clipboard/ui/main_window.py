@@ -26,6 +26,7 @@ from ..models import ClipItem, Snippet
 from ..paths import data_dir, default_export_dir
 from ..portability import ImportError_, export_json, export_text, import_from_file
 from ..settings import Settings, SettingsStore
+from ..windows import autostart
 from . import icons
 from . import theme as theme_mod
 from .format import count_label
@@ -48,6 +49,9 @@ _SECTIONS = {
     "code": ("type", "code", "Code"),
     "text": ("type", "text,multiline", "Text"),
 }
+
+# Toasts are a single line: keep messages from outgrowing the window.
+_TOAST_MESSAGE_LIMIT = 160
 
 
 class MainWindow(QMainWindow):
@@ -192,9 +196,11 @@ class MainWindow(QMainWindow):
                 self._history_view.select_item(selected)
 
     def refresh_snippets(self, keep_selection: bool = True) -> None:
+        search = self._snippets_view.search_text().strip()
+        snippets = self._history.snippets(search)
+        total = len(self._history.snippets()) if search else len(snippets)
         self._snippets_view.set_snippets(
-            self._history.snippets(self._snippets_view.search_text()),
-            keep_selection=keep_selection,
+            snippets, keep_selection=keep_selection, total=total
         )
 
     def refresh_sidebar_counts(self) -> None:
@@ -265,11 +271,23 @@ class MainWindow(QMainWindow):
                 icon_color="#e5615a",
             )
             return
+        self._ignore_next_capture(item.content)
         if item.id is not None:
             self._history.mark_copied(item.id)
         self.refresh_history(keep_selection=True)
         self.refresh_sidebar_counts()
         self.show_toast("Copied to clipboard", icon_name="copy")
+
+    def _ignore_next_capture(self, text: str) -> None:
+        """Tell the monitor not to re-capture text we just wrote ourselves.
+
+        Without this, copying from history made the monitor capture our own
+        write a moment later, bumping copy_count a second time and recording
+        our own process as the source application.
+        """
+        monitor = getattr(QApplication.instance(), "clipboard_monitor", None)
+        if monitor is not None:
+            monitor.ignore_next(text)
 
     def _on_preview_copy(self, payload) -> None:
         if isinstance(payload, Snippet):
@@ -285,6 +303,7 @@ class MainWindow(QMainWindow):
                 icon_color="#e5615a",
             )
             return
+        self._ignore_next_capture(snippet.content)
         self.show_toast(f"Copied “{snippet.title}” to clipboard", icon_name="copy")
 
     def _on_pin_shortcut(self, item: ClipItem) -> None:
@@ -401,7 +420,10 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.warning(
             self,
             "Delete all data",
-            "This permanently deletes ALL clipboard history and saved snippets.\n\n"
+            "This permanently deletes ALL clipboard history, saved snippets "
+            "and settings.\n\n"
+            "Preferences (including the global shortcut and start-with-Windows) "
+            "return to their defaults.\n\n"
             "This cannot be undone. Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -412,11 +434,25 @@ class MainWindow(QMainWindow):
         for snippet in self._history.snippets():
             if snippet.id is not None:
                 self._history.delete_snippet(snippet.id)
+        # The dialog promises settings are removed too: drop the Windows
+        # startup entry (the registry is not part of the settings file) and
+        # reset every stored preference to its default.
+        try:
+            autostart.set_enabled(False)
+        except Exception:  # noqa: BLE001 - registry failure must not abort
+            log.exception("Could not remove the Windows startup entry")
+        try:
+            self._store.reset()
+        except Exception:  # noqa: BLE001
+            log.exception("Could not reset settings")
         self._preview.clear()
         self._preview_item = None
         self.refresh_all()
         self.show_toast(
-            "All clipboard data deleted", icon_name="shield", icon_color="#e5615a"
+            "All clipboard data deleted",
+            icon_name="shield",
+            icon_color="#e5615a",
+            duration_ms=5000,
         )
 
     # ==================================================================
@@ -553,6 +589,8 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "Import failed", f"Could not read file:\n{exc}")
             return
+        # Imported entries must respect the size and retention limits too.
+        self._history.trim_history()
         self.refresh_all()
         self.show_toast(
             f"Import finished: {result.summary}",
@@ -672,6 +710,13 @@ class MainWindow(QMainWindow):
         if not self._toast.isVisible():
             return
         self._toast.adjustSize()
+        # Keep the toast inside the window: a long message (or a narrow
+        # window) must not push it off either edge.  show_toast() releases
+        # this cap again before each new message so short messages still
+        # size naturally.
+        max_width = max(200, self.width() - 32)
+        if self._toast.width() > max_width:
+            self._toast.setFixedWidth(max_width)
         width = self._toast.width()
         height = self._toast.height()
         x = (self.width() - width) // 2
@@ -679,6 +724,14 @@ class MainWindow(QMainWindow):
         self._toast.move(max(8, x), max(8, y))
 
     def show_toast(self, message: str, **kwargs) -> None:
+        # A single-line toast cannot show a whole pasted document; keep the
+        # message readable and cheap to lay out.
+        if len(message) > _TOAST_MESSAGE_LIMIT:
+            message = message[: _TOAST_MESSAGE_LIMIT - 1] + "…"
+        # Release a width cap applied by _position_toast for an earlier,
+        # longer message (setFixedWidth pins both the minimum and maximum).
+        self._toast.setMinimumWidth(0)
+        self._toast.setMaximumWidth(16_777_215)
         self._toast.show_message(message, **kwargs)
         self._toast.raise_()
         self._position_toast()
@@ -709,7 +762,15 @@ class MainWindow(QMainWindow):
             self._store.update(last_section=self._current_section)
         except Exception:  # noqa: BLE001
             log.exception("Could not persist last section")
-        if self._store.get().minimize_to_tray:
+        # Hide to tray only when a tray actually exists; otherwise hiding
+        # would leave no way to reach (or exit) the app.  app.py always sets
+        # the flag before the event loop starts; the default keeps the
+        # historical behaviour for windows used outside the composition root
+        # (e.g. tests).
+        tray_available = bool(
+            getattr(QApplication.instance(), "tray_available", True)
+        )
+        if tray_available and self._store.get().minimize_to_tray:
             event.ignore()
             self.hide()
             log.info("Window hidden to system tray")

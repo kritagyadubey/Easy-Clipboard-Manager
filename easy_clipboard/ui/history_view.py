@@ -197,14 +197,22 @@ class HistoryView(QWidget):
         self._title_label.setText(title)
 
     def set_result_count(self, shown: int, total: int, searching: bool) -> None:
+        """Show how many entries are visible — and of how many in total.
+
+        The "of total" part also matters when *not* searching: the list
+        renders at most 1000 rows, so shown < total must be reported there
+        too instead of implying the list is complete.
+        """
         if shown == 0:
             self._count_label.setText("")
-        elif searching:
-            self._count_label.setText(
-                f"{fmt.count_label(shown, 'match', 'matches')} of {total:,}"
-            )
+            return
+        if searching:
+            label = fmt.count_label(shown, "match", "matches")
         else:
-            self._count_label.setText(fmt.count_label(shown))
+            label = fmt.count_label(shown)
+        if shown < total:
+            label = f"{label} of {total:,}"
+        self._count_label.setText(label)
 
     def set_items(self, items: list[ClipItem], *, keep_selection: bool = False) -> None:
         previous_id = self._selected_id if keep_selection else None
@@ -218,6 +226,10 @@ class HistoryView(QWidget):
             else:
                 self._selected_id = None
                 self._list.clearSelection()
+        else:
+            # Nothing to restore: drop the mirror of the selection so a
+            # deleted/filtered-away id cannot linger and be reselected later.
+            self._selected_id = None
         self._update_empty_states()
 
     def set_sort(self, sort_key: str) -> None:

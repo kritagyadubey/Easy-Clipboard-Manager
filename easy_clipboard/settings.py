@@ -28,6 +28,25 @@ MIN_HISTORY_LIMIT = 25
 MAX_RETENTION_DAYS = 3650  # effectively "forever" for practical purposes
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    """Coerce loosely-typed JSON values to a real bool.
+
+    ``bool("false")`` is ``True`` in Python, so plain ``bool()`` would turn a
+    hand-edited "false" in the settings file into an enabled preference.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in ("1", "true", "yes", "on"):
+            return True
+        if token in ("0", "false", "no", "off", ""):
+            return False
+    return default
+
+
 @dataclass
 class Settings:
     # General -----------------------------------------------------------------
@@ -54,12 +73,21 @@ class Settings:
     def normalised(self) -> "Settings":
         """Return a copy with every value coerced to a valid range."""
         s = deepcopy(self)
+        s.launch_at_startup = _as_bool(s.launch_at_startup, False)
+        s.minimize_to_tray = _as_bool(s.minimize_to_tray, True)
+        s.start_minimized = _as_bool(s.start_minimized, False)
+        s.monitoring_enabled = _as_bool(s.monitoring_enabled, True)
         if s.theme not in THEMES:
             s.theme = "dark"
         if s.density not in DENSITIES:
             s.density = "comfortable"
         if s.duplicate_handling not in DUPLICATE_MODES:
             s.duplicate_handling = "refresh"
+        if not isinstance(s.window_geometry, str):
+            # _restore_geometry calls .encode() on this; a stray int would crash.
+            s.window_geometry = ""
+        if not isinstance(s.last_section, str):
+            s.last_section = "all"
         try:
             s.max_items = int(s.max_items)
         except (TypeError, ValueError):
@@ -119,6 +147,19 @@ class SettingsStore:
         """``callback(new_settings)`` runs after every persisted change."""
         self._listeners.append(callback)
 
+    def reset(self) -> Settings:
+        """Restore every preference to its default and notify listeners.
+
+        Used by "Delete all data" — the dialog promises that settings are
+        removed too, not just history and snippets.
+        """
+        with self._lock:
+            self._settings = Settings().normalised()
+            snapshot = deepcopy(self._settings)
+        self.save()
+        self._notify(snapshot)
+        return snapshot
+
     def _notify(self, settings: Settings) -> None:
         for callback in list(self._listeners):
             try:
@@ -134,6 +175,10 @@ class SettingsStore:
                 return
             try:
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    # e.g. "null", a JSON array or a bare number: valid JSON,
+                    # but not a settings object (raw.items() would raise).
+                    raise TypeError(f"settings root is {type(raw).__name__}, not an object")
                 known = {f for f in Settings.__dataclass_fields__}
                 data = {k: v for k, v in raw.items() if k in known}
                 self._settings = Settings(**data).normalised()

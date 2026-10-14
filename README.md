@@ -121,8 +121,18 @@ pip install -r requirements-dev.txt
 packaging\build_windows.bat
 ```
 
-The result is `dist\EasyClipboardManager\EasyClipboardManager.exe` (a onedir build —
-keep the whole folder together).
+The result is a single self-contained file: `dist\EasyClipboardManager.exe`.
+No Python installation is required on the target machine, no console window
+appears, and the icon/version metadata are embedded from `packaging\app.ico`
+and `packaging\file_version_info.txt`. The build does not require admin rights.
+
+Verify a built executable (launches it against a throw-away data folder —
+never touches your real data):
+
+```powershell
+python scripts\verify_exe.py phase1   # launch, capture, privacy, single instance, exit
+python scripts\verify_exe.py full      # + UI copy-back, restart persistence, unicode path
+```
 
 ## Development
 
@@ -187,13 +197,22 @@ Logs are at `%LOCALAPPDATA%\EasyClipboardManager\app.log`.
 
 Stated honestly so nothing here is mistaken for a guarantee:
 
-- **Verified on this machine:** the pytest suite (143 tests) passes, `pyflakes` is clean,
-  all screenshots in this README are renders of the running application, and the
-  PyInstaller build produces an executable that starts and creates its data folder.
-- **Not verified here:** automated tests run with offscreen Qt, so the system tray,
-  global hotkey registration, clipboard polling against real applications, and
-  launch-at-startup are exercised only manually — Windows-specific integration is not
-  covered by CI.
+- **Verified on this machine:** the pytest suite (174 tests) passes, `pyflakes` is
+  clean, all screenshots in this README are renders of the running application, and
+  the packaged `dist\EasyClipboardManager.exe` passes the automated verification
+  harness (`scripts\verify_exe.py`): window appears with the correct title, no
+  console window, clipboard text captured into the database, logs contain no
+  clipboard text, second launch exits as a single instance, `Enter` copies the
+  selected entry back to the clipboard, the app's own write is not re-captured,
+  history persists across restart, a Unicode/spaces data folder works, close and
+  exit are graceful (exit code 0), and the real user data folder is untouched.
+  ![Packaged EXE running](docs/verification-screenshot.png)
+- **Not verified here:** automated tests run with offscreen Qt, so the system tray
+  icon, global hotkey registration against other running programs, and
+  launch-at-startup are exercised only manually — Windows-specific integration is
+  not covered by CI. The tray icon and global shortcut do register successfully in
+  the packaged build on this machine (confirmed via `app.log`), but tray
+  interactions (menu clicks, restore-from-tray) were not automated.
 - **App exclusion rules are best effort.** The source app is identified from the
   foreground window at capture time. If the clipboard is set programmatically, or the
   foreground window changes before the poll fires, attribution can be wrong or missing.
